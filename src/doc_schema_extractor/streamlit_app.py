@@ -20,14 +20,37 @@ OLLAMA_MODELS = ["gemma4:e4b-it-qat", "qwen3.5:2b", "gemma4:e2b"]
 OPENAI_MODELS = ["gpt-4o-mini", "gpt-4o", "o4-mini"]
 
 
+def _default_backend() -> str:
+    """Read LLM_BACKEND from env; default to openai."""
+    return os.getenv("LLM_BACKEND", "openai").lower()
+
+
 def _answer_ollama(prompt: str, model: str) -> str:
     base_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
-    payload = {"model": model, "prompt": prompt, "stream": False, "options": {"temperature": 0.1, "num_predict": 1024}}
-    logger.debug("Chat->Ollama model=%s prompt_chars=%s", model, len(prompt))
-    with httpx.Client(timeout=120.0) as client:
-        resp = client.post(f"{base_url}/api/generate", json=payload)
-        resp.raise_for_status()
-    return resp.json().get("response", "No response.")
+    timeout = float(os.getenv("OLLAMA_TIMEOUT", "300"))
+    payload = {
+        "model": model,
+        "prompt": prompt,
+        "stream": True,
+        "options": {"temperature": 0.1, "num_predict": 1024},
+    }
+    logger.debug("Chat->Ollama (streaming) model=%s prompt_chars=%s", model, len(prompt))
+    chunks: list[str] = []
+    t = httpx.Timeout(connect=10.0, read=timeout, write=30.0, pool=5.0)
+    with httpx.Client(timeout=t) as client:
+        with client.stream("POST", f"{base_url}/api/generate", json=payload) as resp:
+            resp.raise_for_status()
+            for line in resp.iter_lines():
+                if not line:
+                    continue
+                try:
+                    chunk = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                chunks.append(chunk.get("response", ""))
+                if chunk.get("done"):
+                    break
+    return "".join(chunks) or "No response."
 
 
 def _answer_openai(prompt: str, model: str) -> str:
@@ -47,18 +70,25 @@ def _answer_openai(prompt: str, model: str) -> str:
 
 def answer_question(question: str, extraction_result: dict, backend_name: str, model: str) -> str:
     from doc_schema_extractor.tracing import trace_chat_turn
-    trace_chat_turn(question=question, template_id=extraction_result.get("template_id"), backend=backend_name, model=model)
-
-    logger.info("Chat question backend=%s model=%s template_id=%s question=%s", backend_name, model, extraction_result.get("template_id"), question)
+    trace_chat_turn(
+        question=question,
+        template_id=extraction_result.get("template_id"),
+        backend=backend_name,
+        model=model,
+    )
+    logger.info(
+        "Chat question backend=%s model=%s template_id=%s question=%s",
+        backend_name, model, extraction_result.get("template_id"), question,
+    )
     data_str = json.dumps(extraction_result.get("data", {}), ensure_ascii=False, indent=2)
     raw_text = (extraction_result.get("raw_text") or "")[:8000]
     prompt = (
-        "You are a supply chain document assistant. Answer questions based on the extracted data and document text below. Be concise. If something is not present, say so.\n\n"
+        "You are a supply chain document assistant. Answer questions based on the extracted data "
+        "and document text below. Be concise. If something is not present, say so.\n\n"
         f"=== Extracted fields ===\n{data_str}\n\n"
         f"=== Raw document text (preview) ===\n{raw_text}\n\n"
         f"Question: {question}"
     )
-
     if backend_name == "openai":
         return _answer_openai(prompt, model)
     return _answer_ollama(prompt, model)
@@ -69,37 +99,57 @@ def main():
     st.title("📄 Doc Schema Extractor")
     logger.info("Streamlit UI started")
 
+    # ── Sidebar ──────────────────────────────────────────────────────────────
     with st.sidebar:
         st.header("⚙️ Config")
-        backend_name = st.selectbox("LLM Backend", ["ollama", "openai"])
-        model = st.selectbox("Model", OLLAMA_MODELS if backend_name == "ollama" else OPENAI_MODELS)
+        default_backend = _default_backend()
+        backend_index = 0 if default_backend == "ollama" else 1
+        backend_name = st.selectbox("LLM Backend", ["ollama", "openai"], index=backend_index)
+        model = st.selectbox(
+            "Model",
+            OLLAMA_MODELS if backend_name == "ollama" else OPENAI_MODELS,
+        )
         threshold = st.slider("Match threshold", 0.50, 0.95, 0.75, 0.05)
+        if backend_name == "ollama":
+            timeout_val = st.number_input(
+                "Ollama timeout (s)",
+                min_value=30,
+                max_value=900,
+                value=int(os.getenv("OLLAMA_TIMEOUT", "300")),
+                step=30,
+            )
         st.divider()
         langsmith_on = os.getenv("LANGSMITH_TRACING", "false").lower() == "true"
         project = os.getenv("LANGSMITH_PROJECT", "—")
         if langsmith_on:
-            st.success(f"LangSmith tracing ON\nProject: `{project}`")
+            st.success(f"LangSmith ON\n`{project}`")
         else:
-            st.warning("LangSmith tracing OFF\nSet LANGSMITH_TRACING=true in .env")
+            st.warning("LangSmith OFF\nSet LANGSMITH_TRACING=true")
 
+    # ── Session state ─────────────────────────────────────────────────────────
     if "messages" not in st.session_state:
         st.session_state.messages = []
     if "extraction_result" not in st.session_state:
         st.session_state.extraction_result = None
 
+    # ── File upload + extraction ──────────────────────────────────────────────
     uploaded = st.file_uploader("Upload PDF or XLSX", type=["pdf", "xlsx"])
     if uploaded:
         suffix = Path(uploaded.name).suffix
         with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
             tmp.write(uploaded.getbuffer())
             tmp_path = tmp.name
-        logger.info("Uploaded file name=%s suffix=%s temp_path=%s", uploaded.name, suffix, tmp_path)
+        logger.info("Uploaded file name=%s temp_path=%s", uploaded.name, tmp_path)
 
         if st.button("▶ Run Extraction", type="primary"):
             from doc_schema_extractor import Extractor
             from doc_schema_extractor.backends import OllamaBackend, OpenAIBackend
 
-            be = OpenAIBackend(model=model) if backend_name == "openai" else OllamaBackend(model=model)
+            if backend_name == "openai":
+                be = OpenAIBackend(model=model)
+            else:
+                be = OllamaBackend(model=model, timeout=float(timeout_val))
+
             extractor = Extractor(backend=be, match_threshold=threshold)
             with st.spinner("Extracting..."):
                 result = extractor.extract(tmp_path)
@@ -107,9 +157,17 @@ def main():
             st.session_state.extraction_result = json.loads(result.model_dump_json())
             st.session_state.messages = []
             badge = "🟡 LLM" if result.llm_used else "🟢 Template HIT"
-            logger.info("UI extraction complete template_id=%s llm_used=%s score=%.3f", result.template_id, result.llm_used, result.match_score)
-            st.success(f"{badge} | template=`{result.template_id}` | score={result.match_score:.2f} | valid={'✓' if result.validation_passed else '✗'}")
+            logger.info(
+                "UI extraction complete template_id=%s llm_used=%s score=%.3f",
+                result.template_id, result.llm_used, result.match_score,
+            )
+            st.success(
+                f"{badge} | template=`{result.template_id}` | "
+                f"score={result.match_score:.2f} | "
+                f"valid={'✓' if result.validation_passed else '✗'}"
+            )
 
+    # ── Results ───────────────────────────────────────────────────────────────
     if st.session_state.extraction_result:
         er = st.session_state.extraction_result
         col1, col2 = st.columns([3, 2])
