@@ -8,29 +8,21 @@ from typing import Any
 
 from openai import OpenAI
 
+from ..logging_utils import get_logger
 from ..models import Template
 from .base import LLMBackend, SYSTEM_PROMPT
 
-# Allowed models only
 ALLOWED_MODELS = {"gpt-4o", "gpt-4o-mini", "o4-mini"}
+logger = get_logger("backends.openai")
 
 
 class OpenAIBackend(LLMBackend):
-    """OpenAI backend with JSON mode."""
-
-    def __init__(
-        self,
-        model: str = "gpt-4o-mini",
-        api_key: str | None = None,
-    ):
+    def __init__(self, model: str = "gpt-4o-mini", api_key: str | None = None):
         if model not in ALLOWED_MODELS:
-            raise ValueError(
-                f"Model '{model}' not allowed. Choose from: {ALLOWED_MODELS}"
-            )
+            raise ValueError(f"Model '{model}' not allowed. Choose from: {ALLOWED_MODELS}")
         self._model = model
-        self._client = OpenAI(
-            api_key=api_key or os.getenv("OPENAI_API_KEY")
-        )
+        self._client = OpenAI(api_key=api_key or os.getenv("OPENAI_API_KEY"))
+        logger.info("Initialized OpenAI backend model=%s", model)
 
     @property
     def name(self) -> str:
@@ -40,25 +32,12 @@ class OpenAIBackend(LLMBackend):
     def model(self) -> str:
         return self._model
 
-    def extract_and_generate_template(
-        self, raw_text: str, existing_template: Template | None = None
-    ) -> dict[str, Any]:
+    def extract_and_generate_template(self, raw_text: str, existing_template: Template | None = None) -> dict[str, Any]:
         update_hint = ""
         if existing_template:
-            update_hint = (
-                f"\n\nNote: A previous template exists for this document type "
-                f"(id: {existing_template.template_id}). "
-                f"Please update/improve it based on the new document. "
-                f"Keep the same template_id."
-            )
+            update_hint = f"\n\nNote: A previous template exists (id: {existing_template.template_id}). Keep the same template_id and improve it."
 
-        user_content = (
-            f"{update_hint}\n\nDocument text to extract from:\n"
-            f"---\n{raw_text}\n---\n\nRespond ONLY with the JSON object."
-        )
-
-        # o4-mini doesn't support response_format=json_object in the same way
-        # Use standard JSON mode for gpt-4o family
+        user_content = f"{update_hint}\n\nDocument text to extract from:\n---\n{raw_text}\n---\n\nRespond ONLY with the JSON object."
         kwargs: dict[str, Any] = {
             "model": self._model,
             "temperature": 0.1,
@@ -67,17 +46,19 @@ class OpenAIBackend(LLMBackend):
                 {"role": "user", "content": user_content},
             ],
         }
-
         if self._model in {"gpt-4o", "gpt-4o-mini"}:
             kwargs["response_format"] = {"type": "json_object"}
 
+        logger.debug("Calling OpenAI model=%s existing_template=%s payload_chars=%s", self._model, existing_template.template_id if existing_template else None, len(user_content))
         response = self._client.chat.completions.create(**kwargs)
-        raw = response.choices[0].message.content or "{}"
-
-        # Strip markdown fences just in case
-        raw = raw.strip()
+        raw = (response.choices[0].message.content or "{}").strip()
         if raw.startswith("```"):
             raw = raw.split("\n", 1)[-1]
             raw = raw.rsplit("```", 1)[0]
-
-        return json.loads(raw)
+        try:
+            parsed = json.loads(raw)
+            logger.info("OpenAI response parsed model=%s keys=%s", self._model, list(parsed.keys()))
+            return parsed
+        except Exception:
+            logger.exception("Failed to parse OpenAI response model=%s raw_preview=%s", self._model, raw[:1000])
+            raise

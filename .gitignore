@@ -8,8 +8,7 @@ venv/
 .pytest_cache/
 dist/
 *.egg-info/
-# Template store may contain sensitive extracted data
 templates/store.json
-# Test document uploads
 tests/fixtures/*.pdf
 tests/fixtures/*.xlsx
+logs/
