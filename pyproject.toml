@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "doc-schema-extractor"
-version = "0.2.0"
+version = "0.2.1"
 description = "Template-guided PDF/XLSX extraction with LLM bootstrap and deterministic rule reuse"
 readme = "README.md"
 requires-python = ">=3.11"
