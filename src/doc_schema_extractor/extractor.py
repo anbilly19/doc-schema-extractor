@@ -1,13 +1,15 @@
-"""Main Extractor orchestrator with LangSmith tracing."""
+"""Main Extractor orchestrator with LangSmith tracing and audit logging."""
 
 from __future__ import annotations
 
 import os
+import time
 from pathlib import Path
 from typing import Any
 
 from langsmith import traceable
 
+from .audit_log import AuditLog
 from .backends.base import LLMBackend
 from .backends.ollama import OllamaBackend
 from .backends.openai_backend import OpenAIBackend
@@ -23,7 +25,7 @@ logger = get_logger("extractor")
 
 
 def _build_default_backend() -> LLMBackend:
-    backend = os.getenv("LLM_BACKEND", "ollama").lower()
+    backend = os.getenv("LLM_BACKEND", "openai").lower()
     if backend == "openai":
         model = os.getenv("OPENAI_DEFAULT_MODEL", "gpt-4o-mini")
         logger.info("Using default OpenAI backend model=%s", model)
@@ -34,7 +36,13 @@ def _build_default_backend() -> LLMBackend:
 
 
 class Extractor:
-    def __init__(self, backend: LLMBackend | None = None, store_path: str | Path = "templates/store.json", match_threshold: float | None = None):
+    def __init__(
+        self,
+        backend: LLMBackend | None = None,
+        store_path: str | Path = "templates/store.json",
+        match_threshold: float | None = None,
+        audit_log: AuditLog | None = None,
+    ):
         self._backend = backend or _build_default_backend()
         self._store = TemplateStore(store_path)
         self._text_extractor = TextExtractor()
@@ -42,20 +50,35 @@ class Extractor:
         self._validator = Validator()
         self._threshold = match_threshold or float(os.getenv("TEMPLATE_MATCH_THRESHOLD", "0.75"))
         self._raw_preview_chars = int(os.getenv("LOG_RAW_TEXT_PREVIEW_CHARS", "2000"))
-        logger.info("Extractor initialized backend=%s model=%s threshold=%.2f store=%s", self._backend.name, self._backend.model, self._threshold, store_path)
+        self._audit = audit_log or AuditLog()
+        logger.info(
+            "Extractor initialized backend=%s model=%s threshold=%.2f store=%s",
+            self._backend.name, self._backend.model, self._threshold, store_path,
+        )
 
     @traceable(name="extraction_run")
     def extract(self, file_path: str | Path) -> ExtractionResult:
         logger.info("Extraction run started file=%s", file_path)
+        t_start = time.monotonic()
         path = Path(file_path)
         doc = self._text_extractor.extract(path)
 
-        logger.debug("Document summary file=%s type=%s chars=%s pages=%s preview=%s", path, doc.file_type, len(doc.full_text), len(doc.pages), self._preview(doc.full_text))
+        logger.debug(
+            "Document summary file=%s type=%s chars=%s pages=%s preview=%s",
+            path, doc.file_type, len(doc.full_text), len(doc.pages),
+            self._preview(doc.full_text),
+        )
 
         result = ExtractionResult(document_path=str(path), raw_text=doc.full_text)
 
-        trace_template_match(raw_text_preview=doc.full_text, threshold=self._threshold, template_count=len(self._store.list_all()))
-        template, score = self._store.match(doc.full_text, self._threshold)
+        trace_template_match(
+            raw_text_preview=doc.full_text,
+            threshold=self._threshold,
+            template_count=len(self._store.list_all()),
+        )
+        template, score, candidate_scores = self._store.match_with_scores(
+            doc.full_text, self._threshold
+        )
         result.match_score = score
 
         if template:
@@ -72,21 +95,41 @@ class Extractor:
                 result.llm_used = False
                 template.increment_hit()
                 self._store.add(template)
-                logger.info("Extraction completed via template template_id=%s", template.template_id)
+                self._write_audit(result, candidate_scores, t_start)
+                logger.info("Extraction complete via template template_id=%s", template.template_id)
                 return result
 
-            logger.warning("Template validation failed template_id=%s errors=%s", template.template_id, errors)
+            logger.warning("Validation failed template_id=%s errors=%s", template.template_id, errors)
             result.validation_errors = errors
-            return self._llm_extract(result, doc.full_text, existing_template=template)
+            result = self._llm_extract(result, doc.full_text, existing_template=template)
+            self._write_audit(result, candidate_scores, t_start)
+            return result
 
         logger.info("Template MISS score=%.3f; falling back to LLM", score)
-        return self._llm_extract(result, doc.full_text)
+        result = self._llm_extract(result, doc.full_text)
+        self._write_audit(result, candidate_scores, t_start)
+        return result
 
-    def _llm_extract(self, result: ExtractionResult, raw_text: str, existing_template: Template | None = None) -> ExtractionResult:
-        logger.info("LLM extraction start backend=%s model=%s existing_template=%s preview=%s", self._backend.name, self._backend.model, existing_template.template_id if existing_template else None, self._preview(raw_text))
-        trace_llm_call(backend=self._backend.name, model=self._backend.model, existing_template_id=existing_template.template_id if existing_template else None)
+    def _llm_extract(
+        self,
+        result: ExtractionResult,
+        raw_text: str,
+        existing_template: Template | None = None,
+    ) -> ExtractionResult:
+        logger.info(
+            "LLM extraction start backend=%s model=%s existing_template=%s",
+            self._backend.name, self._backend.model,
+            existing_template.template_id if existing_template else None,
+        )
+        trace_llm_call(
+            backend=self._backend.name,
+            model=self._backend.model,
+            existing_template_id=existing_template.template_id if existing_template else None,
+        )
         try:
-            llm_response = self._backend.extract_and_generate_template(raw_text, existing_template=existing_template)
+            llm_response = self._backend.extract_and_generate_template(
+                raw_text, existing_template=existing_template
+            )
             template = _build_template_from_llm_response(llm_response)
             self._store.add(template)
             result.template_id = template.template_id
@@ -101,13 +144,63 @@ class Extractor:
             logger.exception("LLM extraction failed backend=%s model=%s", self._backend.name, self._backend.model)
             raise
 
+    def _write_audit(
+        self,
+        result: ExtractionResult,
+        candidate_scores: dict[str, float],
+        t_start: float,
+    ) -> None:
+        self._audit.record(
+            document_path=result.document_path,
+            template_id=result.template_id,
+            match_score=result.match_score,
+            candidate_scores=candidate_scores,
+            llm_used=result.llm_used,
+            llm_backend=result.llm_backend,
+            llm_model=result.llm_model,
+            validation_passed=result.validation_passed,
+            validation_errors=result.validation_errors,
+            field_count=len(result.data),
+            duration_ms=(time.monotonic() - t_start) * 1000,
+        )
+
     def _preview(self, text: str) -> str:
         return text[: self._raw_preview_chars] + ("..." if len(text) > self._raw_preview_chars else "")
 
 
 def _build_template_from_llm_response(resp: dict[str, Any]) -> Template:
-    rules = [ExtractionRule(field=r["field"], type=r.get("type", "string"), regex=r.get("regex"), anchor_regex=r.get("anchor_regex"), stop_regex=r.get("stop_regex"), columns=r.get("columns"), date_format=r.get("date_format")) for r in resp.get("extraction_rules", [])]
-    checks = [ConfidenceCheck(field=c["field"], not_null=c.get("not_null", False), gt=c.get("gt"), lt=c.get("lt"), regex_match=c.get("regex_match")) for c in resp.get("confidence_checks", [])]
+    rules = [
+        ExtractionRule(
+            field=r["field"],
+            type=r.get("type", "string"),
+            regex=r.get("regex"),
+            anchor_regex=r.get("anchor_regex"),
+            stop_regex=r.get("stop_regex"),
+            columns=r.get("columns"),
+            date_format=r.get("date_format"),
+        )
+        for r in resp.get("extraction_rules", [])
+    ]
+    checks = [
+        ConfidenceCheck(
+            field=c["field"],
+            not_null=c.get("not_null", False),
+            gt=c.get("gt"),
+            lt=c.get("lt"),
+            regex_match=c.get("regex_match"),
+        )
+        for c in resp.get("confidence_checks", [])
+    ]
     fp_raw = resp.get("fingerprint", {})
-    fingerprint = Fingerprint(required_keywords=fp_raw.get("required_keywords", []), supplier_hint=fp_raw.get("supplier_hint", ""), doc_type=fp_raw.get("doc_type", "unknown"))
-    return Template(template_id=resp.get("template_id", "unknown_v1"), fingerprint=fingerprint, extraction_rules=rules, confidence_checks=checks, metadata={"llm_generated": True})
+    fingerprint = Fingerprint(
+        required_keywords=fp_raw.get("required_keywords", []),
+        supplier_hint=fp_raw.get("supplier_hint", ""),
+        doc_type=fp_raw.get("doc_type", "unknown"),
+    )
+    return Template(
+        template_id=resp.get("template_id", "unknown_v1"),
+        fingerprint=fingerprint,
+        extraction_rules=rules,
+        confidence_checks=checks,
+        metadata={"llm_generated": True},
+    )
