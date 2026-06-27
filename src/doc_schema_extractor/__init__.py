@@ -7,4 +7,4 @@ from .extractor import Extractor
 from .models import ExtractionResult, Template
 
 __all__ = ["Extractor", "ExtractionResult", "Template"]
-__version__ = "0.2.2"
+__version__ = "0.2.3"
