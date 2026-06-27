@@ -1,10 +1,12 @@
-"""Main Extractor orchestrator."""
+"""Main Extractor orchestrator with LangSmith tracing."""
 
 from __future__ import annotations
 
 import os
 from pathlib import Path
 from typing import Any
+
+from langsmith import traceable
 
 from .backends.base import LLMBackend
 from .backends.ollama import OllamaBackend
@@ -14,6 +16,7 @@ from .rule_engine import RuleEngine
 from .template_store import TemplateStore
 from .text_extractor import TextExtractor
 from .validator import Validator
+from .tracing import trace_llm_call, trace_rule_engine, trace_template_match, trace_validator
 
 
 def _build_default_backend() -> LLMBackend:
@@ -26,15 +29,7 @@ def _build_default_backend() -> LLMBackend:
 
 
 class Extractor:
-    """Main extraction orchestrator.
-    
-    Flow:
-      1. Extract text from document
-      2. Match against template store
-      3a. HIT:  apply rules deterministically → validate → return
-      3b. MISS: call LLM → save template → return
-      4. If validation fails: fallback to LLM and update template
-    """
+    """Main extraction orchestrator."""
 
     def __init__(
         self,
@@ -51,8 +46,9 @@ class Extractor:
             os.getenv("TEMPLATE_MATCH_THRESHOLD", "0.75")
         )
 
+    @traceable(name="extraction_run")
     def extract(self, file_path: str | Path) -> ExtractionResult:
-        """Extract structured data from a document."""
+        """Extract structured data. Top-level LangSmith span per document."""
         path = Path(file_path)
         doc = self._text_extractor.extract(path)
 
@@ -61,14 +57,25 @@ class Extractor:
             raw_text=doc.full_text,
         )
 
-        # Step 1: Try to match a template
+        trace_template_match(
+            raw_text_preview=doc.full_text,
+            threshold=self._threshold,
+            template_count=len(self._store.list_all()),
+        )
         template, score = self._store.match(doc.full_text, self._threshold)
         result.match_score = score
 
         if template:
-            # HIT: apply deterministic rules
             result.template_id = template.template_id
+            trace_rule_engine(
+                template_id=template.template_id,
+                field_count=len(template.extraction_rules),
+            )
             data = self._rule_engine.apply(template, doc)
+            trace_validator(
+                template_id=template.template_id,
+                check_count=len(template.confidence_checks),
+            )
             passed, errors = self._validator.validate(data, template)
 
             if passed:
@@ -78,15 +85,11 @@ class Extractor:
                 template.increment_hit()
                 self._store.add(template)
                 return result
-            else:
-                # Validation failed → LLM fallback + template update
-                result.validation_errors = errors
-                return self._llm_extract(
-                    result, doc.full_text, existing_template=template
-                )
-        else:
-            # MISS: LLM extraction + template creation
-            return self._llm_extract(result, doc.full_text)
+
+            result.validation_errors = errors
+            return self._llm_extract(result, doc.full_text, existing_template=template)
+
+        return self._llm_extract(result, doc.full_text)
 
     def _llm_extract(
         self,
@@ -94,11 +97,14 @@ class Extractor:
         raw_text: str,
         existing_template: Template | None = None,
     ) -> ExtractionResult:
+        trace_llm_call(
+            backend=self._backend.name,
+            model=self._backend.model,
+            existing_template_id=existing_template.template_id if existing_template else None,
+        )
         llm_response = self._backend.extract_and_generate_template(
             raw_text, existing_template=existing_template
         )
-
-        # Build and save template from LLM response
         template = _build_template_from_llm_response(llm_response)
         self._store.add(template)
 
@@ -108,12 +114,10 @@ class Extractor:
         result.llm_model = self._backend.model
         result.data = llm_response.get("extracted_data", {})
         result.validation_passed = True
-
         return result
 
 
 def _build_template_from_llm_response(resp: dict[str, Any]) -> Template:
-    """Parse LLM JSON response into a Template model."""
     rules = [
         ExtractionRule(
             field=r["field"],
@@ -126,7 +130,6 @@ def _build_template_from_llm_response(resp: dict[str, Any]) -> Template:
         )
         for r in resp.get("extraction_rules", [])
     ]
-
     checks = [
         ConfidenceCheck(
             field=c["field"],
@@ -137,21 +140,16 @@ def _build_template_from_llm_response(resp: dict[str, Any]) -> Template:
         )
         for c in resp.get("confidence_checks", [])
     ]
-
     fp_raw = resp.get("fingerprint", {})
     fingerprint = Fingerprint(
         required_keywords=fp_raw.get("required_keywords", []),
         supplier_hint=fp_raw.get("supplier_hint", ""),
         doc_type=fp_raw.get("doc_type", "unknown"),
     )
-
     return Template(
         template_id=resp.get("template_id", "unknown_v1"),
         fingerprint=fingerprint,
         extraction_rules=rules,
         confidence_checks=checks,
-        metadata={
-            "llm_generated": True,
-            "source_response_keys": list(resp.keys()),
-        },
+        metadata={"llm_generated": True},
     )

@@ -1,10 +1,6 @@
 # doc-schema-extractor
 
-Template-guided PDF/XLSX extraction pipeline for recurring supplier documents.
-
-**Two-phase approach:**
-- **Phase 1 (MISS):** LLM extracts data AND generates reusable extraction rules → saved as template
-- **Phase 2 (HIT):** Pure deterministic rule-based extraction — zero LLM calls
+Template-guided PDF/XLSX extraction pipeline for recurring supplier documents, with LangSmith tracing and a Streamlit chat UI.
 
 ## Supported LLM Backends
 - **Ollama** (local, default): `gemma4:e4b-it-qat`, `qwen3.5:2b`, `gemma4:e2b`
@@ -13,91 +9,67 @@ Template-guided PDF/XLSX extraction pipeline for recurring supplier documents.
 ## Setup
 
 ```bash
-# Install uv if not already installed
 curl -LsSf https://astral.sh/uv/install.sh | sh
-
-# Clone and setup
 git clone https://github.com/anbilly19/doc-schema-extractor
 cd doc-schema-extractor
-
-# Create venv and install
 uv sync
-
-# Copy and configure env
 cp .env.example .env
-# Edit .env with your settings
+# Edit .env with your keys
 ```
 
-## Usage
+## LangSmith
+
+Set these in `.env` to enable tracing:
+
+```
+LANGSMITH_TRACING=true
+LANGSMITH_API_KEY=lsv2_pt_...
+LANGSMITH_PROJECT=doc-schema-extractor
+LANGSMITH_ENDPOINT=https://api.smith.langchain.com
+```
+
+Traced spans:
+- `extraction_run` — full pipeline per document
+- `template_match` — keyword fingerprint scoring
+- `rule_engine_apply` — deterministic field extraction
+- `validator_run` — confidence checks
+- `llm_template_generation` — LLM fallback + template creation
+- `chat_turn` — each user question in the Streamlit UI
+
+## CLI Usage
 
 ```bash
-# Extract a single document
 uv run dse extract path/to/invoice.pdf
-
-# Extract with explicit backend
 uv run dse extract path/to/invoice.pdf --backend openai --model gpt-4o-mini
-
-# List all stored templates
+uv run dse batch ./docs/ --output results.json
 uv run dse templates list
-
-# Show a specific template
 uv run dse templates show redefine_meat_order_confirmation_v1
-
-# Reset/delete a template (forces LLM re-learn on next run)
-uv run dse templates delete <template_id>
-
-# Batch process a folder
-uv run dse batch path/to/docs/ --output results.json
+uv run dse templates delete <template_id> --yes
 ```
 
-## Python API
+## Chat UI
 
-```python
-from doc_schema_extractor import Extractor
-from doc_schema_extractor.backends import OllamaBackend, OpenAIBackend
-
-# Use Ollama (local)
-backend = OllamaBackend(model="gemma4:e4b-it-qat")
-extractor = Extractor(backend=backend)
-
-result = extractor.extract("invoice.pdf")
-print(result.data)          # extracted fields
-print(result.template_id)   # which template was used
-print(result.llm_used)      # True if LLM was called (MISS), False on HIT
+```bash
+uv run streamlit run src/doc_schema_extractor/streamlit_app.py
 ```
 
-## Template Store
-
-Templates are stored as versioned JSON in `templates/store.json` (configurable).
-Each template contains:
-- `fingerprint`: keywords + supplier hint for matching
-- `extraction_rules`: regex/table rules per field
-- `confidence_checks`: validation constraints
-- `metadata`: creation date, hit count, last updated
+- Upload a PDF or XLSX
+- Choose backend and model
+- Run extraction (shows template ID, match score, LLM used)
+- Inspect extracted JSON
+- Chat with the document using the extracted data + raw text as context
+- All runs and chat turns traced in LangSmith
 
 ## Architecture
 
 ```
-doc/
+doc input
   ↓
-[TextExtractor] pdfplumber / openpyxl
+[TextExtractor]  pdfplumber (MIT) + openpyxl (MIT)
   ↓
-[TemplateStore.match()] rapidfuzz keyword fingerprint
-  ├── HIT (score > 0.75)
-  │     ↓
-  │   [RuleEngine.apply()] regex + table parser
-  │     ↓
-  │   [Validator] pydantic + confidence checks
-  │     ↓ pass         ↓ fail
-  │   return result   → LLM fallback + template update
-  │
-  └── MISS
-        ↓
-      [LLMBackend] Ollama or OpenAI
-        ↓  (structured output: data + extraction_rules)
-      [TemplateStore.save()] new template
-        ↓
-      return result
+[TemplateStore.match()]  rapidfuzz keyword score
+  ├── HIT → [RuleEngine] → [Validator] → result  (0 LLM calls)
+  └── MISS/FAIL → [LLMBackend] → save template → result
 ```
 
 ## License
