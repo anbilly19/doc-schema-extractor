@@ -12,3 +12,4 @@ templates/store.json
 tests/fixtures/*.pdf
 tests/fixtures/*.xlsx
 logs/
+tests/files/*
