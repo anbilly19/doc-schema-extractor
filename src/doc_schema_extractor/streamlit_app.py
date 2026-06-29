@@ -65,12 +65,9 @@ def _answer_openai(prompt: str, model: str) -> str:
 
 
 def answer_question(question: str, extraction_result: dict, backend_name: str, model: str) -> str:
+    """Generate an answer and trace the full chat turn (question + answer) to LangSmith."""
     from doc_schema_extractor.tracing import trace_chat_turn
-    trace_chat_turn(
-        question=question,
-        template_id=extraction_result.get("template_id"),
-        backend=backend_name, model=model,
-    )
+
     logger.info("Chat question backend=%s model=%s question=%s", backend_name, model, question)
     data_str = json.dumps(extraction_result.get("data", {}), ensure_ascii=False, indent=2)
     raw_text = (extraction_result.get("raw_text") or "")[:8000]
@@ -82,8 +79,20 @@ def answer_question(question: str, extraction_result: dict, backend_name: str, m
         f"Question: {question}"
     )
     if backend_name == "openai":
-        return _answer_openai(prompt, model)
-    return _answer_ollama(prompt, model)
+        answer = _answer_openai(prompt, model)
+    else:
+        answer = _answer_ollama(prompt, model)
+
+    # Trace AFTER answer is generated so LangSmith outputs contain the actual answer.
+    trace_chat_turn(
+        question=question,
+        template_id=extraction_result.get("template_id"),
+        backend=backend_name,
+        model=model,
+        answer=answer,
+        llm_used=extraction_result.get("llm_used", False),
+    )
+    return answer
 
 
 def _render_score_dashboard() -> None:

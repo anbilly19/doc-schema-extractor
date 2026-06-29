@@ -92,23 +92,41 @@ class Extractor:
 
         result = ExtractionResult(document_path=str(path), raw_text=doc.full_text)
 
-        trace_template_match(
-            raw_text_preview=doc.full_text,
-            threshold=self._threshold,
-            template_count=len(self._store.list_all()),
-        )
+        # Run match FIRST, then trace with the actual results so LangSmith
+        # outputs contain matched_template_id / score, not just inputs.
         template, score, candidate_scores = self._store.match_with_scores(
             doc.full_text, self._threshold
         )
         result.match_score = score
+        trace_template_match(
+            raw_text_preview=doc.full_text,
+            threshold=self._threshold,
+            template_count=len(self._store.list_all()),
+            matched_template_id=template.template_id if template else None,
+            match_score=score,
+            candidate_scores=candidate_scores,
+        )
 
         if template:
             logger.info("Template HIT template_id=%s score=%.3f", template.template_id, score)
             result.template_id = template.template_id
-            trace_rule_engine(template_id=template.template_id, field_count=len(template.extraction_rules))
+
+            # Run rule engine FIRST, then trace with extracted fields.
             data = self._rule_engine.apply(template, doc)
-            trace_validator(template_id=template.template_id, check_count=len(template.confidence_checks))
+            trace_rule_engine(
+                template_id=template.template_id,
+                field_count=len(template.extraction_rules),
+                extracted_fields=data,
+            )
+
+            # Run validator FIRST, then trace with pass/fail outcome.
             passed, errors = self._validator.validate(data, template)
+            trace_validator(
+                template_id=template.template_id,
+                check_count=len(template.confidence_checks),
+                passed=passed,
+                errors=errors,
+            )
 
             if passed:
                 result.data = data
@@ -167,11 +185,6 @@ class Extractor:
             self._backend.name, self._backend.model,
             existing_template.template_id if existing_template else None,
         )
-        trace_llm_call(
-            backend=self._backend.name,
-            model=self._backend.model,
-            existing_template_id=existing_template.template_id if existing_template else None,
-        )
         try:
             llm_response = self._backend.extract_and_generate_template(
                 raw_text, existing_template=existing_template
@@ -186,6 +199,14 @@ class Extractor:
             result.llm_model = self._backend.model
             result.data = llm_response.get("extracted_data", {})
             result.validation_passed = True
+            # Trace AFTER LLM call completes so outputs carry real results.
+            trace_llm_call(
+                backend=self._backend.name,
+                model=self._backend.model,
+                existing_template_id=existing_template.template_id if existing_template else None,
+                new_template_id=template.template_id,
+                extracted_field_count=len(result.data),
+            )
             logger.info(
                 "LLM extraction complete template_id=%s fields=%s valid_rules=%s",
                 template.template_id, len(result.data), len(template.extraction_rules),
