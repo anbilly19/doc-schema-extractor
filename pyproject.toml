@@ -24,7 +24,6 @@ dependencies = [
   "rich>=13",
   "python-dotenv>=1.0",
   "langsmith>=0.1.77",
-  "langchain-core>=0.2.30",
   "streamlit>=1.36",
 ]
 
