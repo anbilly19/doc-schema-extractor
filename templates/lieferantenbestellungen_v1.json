@@ -1,0 +1,86 @@
+{
+  "template_id": "lieferantenbestellungen_v1",
+  "fingerprint": {
+    "required_keywords": [
+      "Auftragsnummer",
+      "Bestelldatum",
+      "Lieferantennummer",
+      "Ansprechpartner"
+    ],
+    "supplier_hint": "TMT Taurus Meat Trading GmbH",
+    "doc_type": "purchase_order"
+  },
+  "extraction_rules": [
+    {
+      "field": "order_number",
+      "type": "string",
+      "regex": "Auftragsnummer[:\\s]+([\\d]+-[\\s]*[\\d]+)",
+      "anchor_regex": null,
+      "stop_regex": null,
+      "columns": null,
+      "strip_chars": " ",
+      "date_format": null
+    },
+    {
+      "field": "order_date",
+      "type": "date",
+      "regex": "Bestelldatum[:\\s]*(\\d{1,2}\\.\\d{1,2}\\.\\d{4})",
+      "anchor_regex": null,
+      "stop_regex": null,
+      "columns": null,
+      "strip_chars": null,
+      "date_format": "%d.%m.%Y"
+    },
+    {
+      "field": "supplier_number",
+      "type": "string",
+      "regex": "Lieferantennummer[:\\s]+([\\d]+)",
+      "anchor_regex": null,
+      "stop_regex": null,
+      "columns": null,
+      "strip_chars": null,
+      "date_format": null
+    },
+    {
+      "field": "delivery_date",
+      "type": "date",
+      "regex": "Lieferdatum[:\\s]*(\\d{1,2}\\.\\d{1,2}\\.\\d{4})",
+      "anchor_regex": null,
+      "stop_regex": null,
+      "columns": null,
+      "strip_chars": null,
+      "date_format": "%d.%m.%Y"
+    },
+    {
+      "field": "line_items",
+      "type": "table",
+      "regex": null,
+      "anchor_regex": "Artikelnummer",
+      "stop_regex": "per E-Mail",
+      "columns": ["article_number_tmt", "ff_article_number", "article_name", "order_qty", "min_order_qty", "content_per_carton"],
+      "strip_chars": null,
+      "date_format": null
+    }
+  ],
+  "confidence_checks": [
+    {
+      "field": "order_number",
+      "not_null": true,
+      "gt": null,
+      "lt": null,
+      "regex_match": null
+    },
+    {
+      "field": "order_date",
+      "not_null": true,
+      "gt": null,
+      "lt": null,
+      "regex_match": null
+    }
+  ],
+  "metadata": { "llm_generated": true, "manually_fixed": true },
+  "version": 2,
+  "created_at": "2026-06-27T14:54:10.081861",
+  "updated_at": "2026-06-30T10:00:00",
+  "hit_count": 0
+}
