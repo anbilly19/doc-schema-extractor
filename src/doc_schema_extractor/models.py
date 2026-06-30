@@ -14,7 +14,6 @@ class Fingerprint(BaseModel):
     doc_type: str = "unknown"
     # Quorum: minimum fraction of required_keywords that must match.
     # 1.0 = all must match (old behaviour), 0.6 = 3 of 5 suffice.
-    # Default 0.6 gives robust matching without losing discrimination.
     keyword_quorum: float = Field(default=0.6, ge=0.0, le=1.0)
 
 
@@ -51,3 +50,16 @@ class Template(BaseModel):
     def increment_hit(self) -> None:
         self.hit_count += 1
         self.updated_at = datetime.utcnow()
+
+
+class ExtractionResult(BaseModel):
+    document_path: str = ""
+    raw_text: str = ""
+    template_id: str | None = None
+    match_score: float = 0.0
+    data: dict[str, Any] = Field(default_factory=dict)
+    llm_used: bool = False
+    llm_backend: str | None = None
+    llm_model: str | None = None
+    validation_passed: bool = False
+    validation_errors: list[str] = Field(default_factory=list)
