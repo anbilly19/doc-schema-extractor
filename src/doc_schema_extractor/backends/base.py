@@ -75,13 +75,12 @@ CRITICAL RULES FOR REGEXES:
 - For table fields: set regex to null and provide anchor_regex and stop_regex instead.
 - anchor_regex and stop_regex are also valid Python re patterns but do NOT need a capture group.
 - Do NOT include trailing \\s or open-ended quantifiers that span multiple lines.
-- All backslashes in JSON strings must be double-escaped: \\d not \d.
+- All backslashes in JSON strings must be double-escaped: \\\\d not \\d.
 
 DATE REGEX ANTI-PATTERNS — never produce any of these:
-  WRONG: "([A-Za-z\u2013]{4}-\u2013\u2013\u2013 \u2013\u2013:\u2013\u2013\u2013)"   <- hallucinated placeholder with dashes
-  WRONG: "(0q.0v.2&4)"                    <- garbage characters
-  WRONG: "YYYY-MM-DD"                     <- not a regex, it is a format string
-  WRONG: "([A-Za-z\u2013]+)"              <- en-dashes and letters are not date digits
+  WRONG: hallucinated placeholder with dashes like "([A-Za-z]{4}-... ...)"  <- never
+  WRONG: garbage like "(0q.0v.2&4)"                <- not a regex
+  WRONG: "YYYY-MM-DD"                              <- not a regex, it is a format string
   CORRECT for ISO dates:    "(\\d{4}-\\d{2}-\\d{2})"           date_format: "%Y-%m-%d"
   CORRECT for German dates: "(\\d{1,2}\\.\\d{1,2}\\.\\d{4})"  date_format: "%d.%m.%Y"
   date_format MUST use Python strptime codes only: %d %m %Y %y %H %M %S — nothing else.
