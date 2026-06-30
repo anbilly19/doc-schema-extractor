@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import warnings
 from pathlib import Path
 from dataclasses import dataclass, field
 
@@ -104,7 +105,25 @@ class TextExtractor:
 
     def _extract_xlsx(self, path: Path) -> DocumentContent:
         logger.debug("Extracting XLSX path=%s", path)
-        wb = openpyxl.load_workbook(path, data_only=True)
+
+        # openpyxl emits UserWarnings for unsupported-but-harmless XLSX features
+        # (header/footer XML and Data Validation extensions). Suppress them so
+        # they don't pollute the CLI/Streamlit output.
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                message="Cannot parse header or footer",
+                category=UserWarning,
+                module=r"openpyxl",
+            )
+            warnings.filterwarnings(
+                "ignore",
+                message="Data Validation extension is not supported",
+                category=UserWarning,
+                module=r"openpyxl",
+            )
+            wb = openpyxl.load_workbook(path, data_only=True)
+
         pages: list[PageContent] = []
         all_text_parts: list[str] = []
 
