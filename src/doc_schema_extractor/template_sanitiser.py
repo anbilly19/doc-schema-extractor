@@ -6,8 +6,8 @@ Problems fixed here:
 - Regex that matches nothing against the source document -> rule flagged (kept but warned)
 - Table rule missing anchor_regex or stop_regex -> rule dropped
 - confidence_checks referencing fields not in extraction_rules -> check dropped
-- Fingerprint keywords that collide with existing templates -> replaced with
-  discriminative alternatives mined from the source text (TF-IDF-style scoring)
+- Fingerprint keywords that are not present in source text -> dropped
+- Back-fill with discriminative mined tokens only when LLM proposed too few valid keywords
 """
 
 from __future__ import annotations
@@ -24,11 +24,9 @@ if TYPE_CHECKING:
 
 logger = get_logger("template_sanitiser")
 
-# Minimum token length and character requirement to be a candidate keyword
 _MIN_KW_LEN = 5
 _RE_TOKEN = re.compile(r"[A-Za-z\u00c0-\u024f][A-Za-z\u00c0-\u024f0-9]{%d,}" % (_MIN_KW_LEN - 1))
 
-# Stop-words that are too generic to discriminate between templates
 _STOP_WORDS = {
     "gmbh", "datum", "seite", "bitte", "sehr", "damen", "herren", "liefern",
     "artikel", "menge", "preis", "summe", "gesamt", "netto", "brutto",
@@ -38,7 +36,6 @@ _STOP_WORDS = {
 
 
 def _tokenise(text: str) -> list[str]:
-    """Extract candidate keyword tokens from text."""
     return [m.group(0) for m in _RE_TOKEN.finditer(text)]
 
 
@@ -47,20 +44,12 @@ def _score_keywords(
     source_text: str,
     existing_templates: list[Template],
 ) -> list[tuple[str, float]]:
-    """Score candidate keywords by discriminativeness.
+    """Score candidate tokens by discriminativeness for back-fill use only.
 
-    Score = (frequency in source_text) / (1 + count of existing templates
-    whose keywords contain this token case-insensitively).
-    Higher score = appears often here, rarely in other templates.
+    Score = frequency_in_source / (1 + number_of_existing_templates_that_contain_exact_keyword).
     """
     src_lower = source_text.lower()
     src_counter = Counter(t.lower() for t in candidates)
-
-    # Build a set of all tokens already used across existing templates
-    existing_kw_tokens: set[str] = set()
-    for tmpl in existing_templates:
-        for kw in tmpl.fingerprint.required_keywords:
-            existing_kw_tokens.update(t.lower() for t in _tokenise(kw))
 
     scored: list[tuple[str, float]] = []
     seen_lower: set[str] = set()
@@ -70,12 +59,13 @@ def _score_keywords(
             continue
         seen_lower.add(tl)
         freq = src_counter[tl]
+        # Exact full-string match against existing keyword lists
         collision = sum(
             1 for tmpl in existing_templates
-            if any(tl in kw.lower() for kw in tmpl.fingerprint.required_keywords)
+            if any(tl == kw.lower() for kw in tmpl.fingerprint.required_keywords)
         )
         score = freq / (1.0 + collision)
-        if tl in src_lower:  # must actually appear in source
+        if tl in src_lower:
             scored.append((token, score))
 
     scored.sort(key=lambda x: x[1], reverse=True)
@@ -88,36 +78,35 @@ def _filter_keywords(
     existing_templates: list[Template],
     target_count: int = 5,
 ) -> list[str]:
-    """Return discriminative keywords for this template.
+    """Validate and back-fill fingerprint keywords.
 
-    Keeps proposed keywords that are not over-represented in existing templates,
-    then back-fills with high-scoring tokens mined from source_text.
+    Policy:
+    - Keep ALL proposed keywords that actually appear in the source text.
+      We do NOT drop them for cross-template collision — specificity is the
+      LLM's job and proposed keywords are almost always more specific than
+      anything we can mine automatically.
+    - Only back-fill with mined tokens when fewer than target_count proposed
+      keywords survived the source-text presence check.
     """
     src_lower = source_text.lower()
 
-    # Keep proposed keywords that are present in source and low-collision
     kept: list[str] = []
     for kw in proposed:
-        if kw.lower() not in src_lower:
-            logger.warning("Keyword '%s' not found in source text, dropping", kw)
-            continue
-        collision = sum(
-            1 for tmpl in existing_templates
-            if any(kw.lower() in existing_kw.lower() for existing_kw in tmpl.fingerprint.required_keywords)
-        )
-        if collision == 0:
+        if kw.lower() in src_lower:
             kept.append(kw)
         else:
-            logger.info(
-                "Keyword '%s' collides with %s existing template(s), will try to replace",
-                kw, collision,
-            )
+            logger.warning("Keyword '%s' not found in source text, dropping", kw)
 
     if len(kept) >= target_count:
-        logger.debug("All %s proposed keywords are discriminative", len(kept))
-        return kept[:target_count]
+        logger.debug("Keeping %s proposed keywords (all present in source)", len(kept))
+        return kept
 
-    # Back-fill with high-scoring mined tokens
+    # Back-fill only to reach target_count
+    needed = target_count - len(kept)
+    logger.info(
+        "Only %s/%s proposed keywords present in source; mining %s back-fill tokens",
+        len(kept), len(proposed), needed,
+    )
     candidates = _tokenise(source_text)
     scored = _score_keywords(candidates, source_text, existing_templates)
     kept_lower = {k.lower() for k in kept}
@@ -126,19 +115,20 @@ def _filter_keywords(
             continue
         kept.append(token)
         kept_lower.add(token.lower())
-        logger.info("Added discriminative keyword '%s' (score=%.2f)", token, score)
-        if len(kept) >= target_count:
+        logger.info("Back-fill keyword '%s' (score=%.2f)", token, score)
+        needed -= 1
+        if needed == 0:
             break
 
     logger.info(
-        "Final keywords for new template: %s (from %s proposed, %s existing templates)",
+        "Final keywords for template: %s (proposed=%s existing_templates=%s)",
         kept, len(proposed), len(existing_templates),
     )
     return kept
 
 
 # ---------------------------------------------------------------------------
-# Rule sanitisation (unchanged logic)
+# Rule sanitisation
 # ---------------------------------------------------------------------------
 
 def _count_capture_groups(pattern: str) -> int:
@@ -157,8 +147,6 @@ def _is_valid_regex(pattern: str) -> bool:
 
 
 def sanitise_rule(rule: ExtractionRule, source_text: str) -> ExtractionRule | None:
-    """Validate one extraction rule. Returns None if rule should be dropped."""
-
     if rule.type == "table":
         if not rule.anchor_regex or not rule.stop_regex:
             logger.warning(
@@ -213,12 +201,7 @@ def sanitise_template(
     source_text: str,
     store: "TemplateStore | None" = None,
 ) -> Template:
-    """Sanitise all rules, confidence checks, and fingerprint keywords.
-
-    Pass `store` to enable discriminative keyword filtering; without it,
-    keyword sanitisation is skipped (backward compatible).
-    """
-    # --- keyword filtering ---
+    """Sanitise all rules, confidence checks, and fingerprint keywords."""
     if store is not None:
         existing = [t for t in store.list_all() if t.template_id != template.template_id]
         template.fingerprint.required_keywords = _filter_keywords(
@@ -227,7 +210,6 @@ def sanitise_template(
             existing_templates=existing,
         )
 
-    # --- rule sanitisation ---
     original_count = len(template.extraction_rules)
     valid_rules: list[ExtractionRule] = []
 
