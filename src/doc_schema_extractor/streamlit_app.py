@@ -17,7 +17,16 @@ load_dotenv()
 logger = get_logger("streamlit_app")
 
 OLLAMA_MODELS = ["gemma4:e4b-it-qat", "qwen3.5:2b", "gemma4:e2b"]
-OPENAI_MODELS = ["gpt-4o-mini", "gpt-4o", "o4-mini"]
+OPENAI_MODELS = [
+    "gpt-4.1-mini",
+    "gpt-4.1",
+    "gpt-4.1-nano",
+    "gpt-4o-mini",
+    "gpt-4o",
+    "o4-mini",
+    "gpt-5",
+    "gpt-5-mini",
+]
 
 
 def _default_backend() -> str:
@@ -65,7 +74,6 @@ def _answer_openai(prompt: str, model: str) -> str:
 
 
 def answer_question(question: str, extraction_result: dict, backend_name: str, model: str) -> str:
-    """Generate an answer and trace the full chat turn (question + answer) to LangSmith."""
     from doc_schema_extractor.tracing import trace_chat_turn
 
     logger.info("Chat question backend=%s model=%s question=%s", backend_name, model, question)
@@ -83,7 +91,6 @@ def answer_question(question: str, extraction_result: dict, backend_name: str, m
     else:
         answer = _answer_ollama(prompt, model)
 
-    # Trace AFTER answer is generated so LangSmith outputs contain the actual answer.
     trace_chat_turn(
         question=question,
         template_id=extraction_result.get("template_id"),
@@ -96,7 +103,6 @@ def answer_question(question: str, extraction_result: dict, backend_name: str, m
 
 
 def _render_score_dashboard() -> None:
-    """Show cross-document score table from the audit log."""
     from doc_schema_extractor.audit_log import AuditLog
     audit = AuditLog()
     records = audit.read_all()
@@ -105,35 +111,30 @@ def _render_score_dashboard() -> None:
         return
 
     st.subheader("Cross-document extraction scores")
-
-    # Summary table
     rows = []
     for r in records:
         rows.append({
             "File": r.get("file", ""),
-            "Template": r.get("template_id") or "\u2014",
+            "Template": r.get("template_id") or "—",
             "Score": f"{r.get('match_score', 0):.3f}",
             "Result": r.get("result", ""),
-            "LLM": "\u2713" if r.get("llm_used") else "",
-            "Valid": "\u2713" if r.get("validation_passed") else "\u2717",
+            "LLM": "✓" if r.get("llm_used") else "",
+            "Valid": "✓" if r.get("validation_passed") else "✗",
             "Fields": r.get("field_count", 0),
             "ms": int(r.get("duration_ms", 0)),
             "Time": r.get("ts", "")[:19].replace("T", " "),
         })
-
     st.dataframe(rows, width="stretch")
 
-    # Per-document candidate score breakdown
     with st.expander("Candidate scores per document (all templates vs each file)"):
         for r in records:
             cands = r.get("candidate_scores", {})
             if not cands:
                 continue
-            st.markdown(f"**{r.get('file')}** \u2014 best: `{r.get('template_id') or 'MISS'}` ({r.get('match_score', 0):.3f})")
+            st.markdown(f"**{r.get('file')}** — best: `{r.get('template_id') or 'MISS'}` ({r.get('match_score', 0):.3f})")
             score_rows = [{"Template": tid, "Score": f"{s:.4f}"} for tid, s in sorted(cands.items(), key=lambda x: -x[1])]
             st.dataframe(score_rows, width="stretch", hide_index=True)
 
-    # Raw JSONL download
     raw_lines = "\n".join(json.dumps(r, ensure_ascii=False) for r in records)
     st.download_button(
         "Download audit log (JSONL)",
@@ -143,13 +144,83 @@ def _render_score_dashboard() -> None:
     )
 
 
+def _render_template_editor() -> None:
+    """Template store CRUD editor."""
+    from doc_schema_extractor.template_store import TemplateStore
+    from doc_schema_extractor.models import Template
+
+    store = TemplateStore()
+    templates = store.list_all()
+
+    st.subheader("Stored templates")
+    if not templates:
+        st.info("No templates in store yet.")
+    else:
+        template_ids = [t.template_id for t in templates]
+        selected_id = st.selectbox("Select template to view / edit / delete", template_ids)
+        tmpl = store.get(selected_id)
+        if tmpl:
+            col_view, col_del = st.columns([4, 1])
+            with col_view:
+                edited_raw = st.text_area(
+                    "Template JSON (edit and press Save to update)",
+                    value=tmpl.model_dump_json(indent=2),
+                    height=420,
+                    key=f"editor_{selected_id}",
+                )
+            with col_del:
+                st.write("")
+                st.write("")
+                if st.button("🗑️ Delete", key=f"del_{selected_id}"):
+                    store.delete(selected_id)
+                    st.success(f"Deleted `{selected_id}`")
+                    st.rerun()
+
+            if st.button("💾 Save changes", key=f"save_{selected_id}"):
+                try:
+                    parsed = json.loads(edited_raw)
+                    updated = Template.model_validate(parsed)
+                    store.add(updated)
+                    st.success(f"Saved `{updated.template_id}`")
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"Invalid JSON or schema error: {exc}")
+
+    st.divider()
+    st.subheader("Add / import template")
+    st.caption("Paste a full template JSON object (single template, not the whole store dict).")
+    new_raw = st.text_area("Paste template JSON here", height=300, key="new_template_input")
+    if st.button("➕ Import template"):
+        if not new_raw.strip():
+            st.warning("Nothing to import.")
+        else:
+            try:
+                parsed = json.loads(new_raw)
+                new_tmpl = Template.model_validate(parsed)
+                store.add(new_tmpl)
+                st.success(f"Imported `{new_tmpl.template_id}` — {len(new_tmpl.extraction_rules)} rules, {len(new_tmpl.fingerprint.required_keywords)} keywords")
+                st.rerun()
+            except Exception as exc:
+                st.error(f"Import failed: {exc}")
+
+    st.divider()
+    st.subheader("Download full store")
+    all_data = {t.template_id: json.loads(t.model_dump_json()) for t in store.list_all()}
+    st.download_button(
+        "⬇️ Download store.json",
+        data=json.dumps(all_data, indent=2, ensure_ascii=False),
+        file_name="store.json",
+        mime="application/json",
+    )
+
+
 def main():
-    st.set_page_config(page_title="Doc Schema Extractor", page_icon="\U0001f4c4", layout="wide")
-    st.title("\U0001f4c4 Doc Schema Extractor")
+    st.set_page_config(page_title="Doc Schema Extractor", page_icon="📄", layout="wide")
+    st.title("📄 Doc Schema Extractor")
     logger.info("Streamlit UI started")
 
     with st.sidebar:
-        st.header("\u2699\ufe0f Config")
+        st.header("⚙️ Config")
         default_backend = _default_backend()
         backend_index = 0 if default_backend == "ollama" else 1
         backend_name = st.selectbox("LLM Backend", ["ollama", "openai"], index=backend_index)
@@ -163,10 +234,12 @@ def main():
                 "Ollama timeout (s)", min_value=30, max_value=900,
                 value=int(os.getenv("OLLAMA_TIMEOUT", "300")), step=30,
             )
+        else:
+            timeout_val = 300
         st.divider()
         langsmith_on = os.getenv("LANGSMITH_TRACING", "false").lower() == "true"
         if langsmith_on:
-            st.success(f"LangSmith ON\n`{os.getenv('LANGSMITH_PROJECT', '\u2014')}`")
+            st.success(f"LangSmith ON\n`{os.getenv('LANGSMITH_PROJECT', '—')}`")
         else:
             st.warning("LangSmith OFF")
 
@@ -175,9 +248,8 @@ def main():
     if "extraction_result" not in st.session_state:
         st.session_state.extraction_result = None
 
-    tab_extract, tab_scores = st.tabs(["Extract", "Score History"])
+    tab_extract, tab_scores, tab_templates = st.tabs(["Extract", "Score History", "📁 Templates"])
 
-    # \u2500\u2500 Extract tab \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
     with tab_extract:
         uploaded = st.file_uploader("Upload PDF or XLSX", type=["pdf", "xlsx"])
         if uploaded:
@@ -187,7 +259,7 @@ def main():
                 tmp_path = tmp.name
             logger.info("Uploaded file name=%s temp_path=%s", uploaded.name, tmp_path)
 
-            if st.button("\u25b6 Run Extraction", type="primary"):
+            if st.button("▶ Run Extraction", type="primary"):
                 from doc_schema_extractor import Extractor
                 from doc_schema_extractor.backends import OllamaBackend, OpenAIBackend
 
@@ -202,7 +274,7 @@ def main():
 
                 st.session_state.extraction_result = json.loads(result.model_dump_json())
                 st.session_state.messages = []
-                badge = "\U0001f7e1 LLM" if result.llm_used else "\U0001f7e2 Template HIT"
+                badge = "🟡 LLM" if result.llm_used else "🟢 Template HIT"
                 logger.info(
                     "UI extraction complete template_id=%s llm_used=%s score=%.3f",
                     result.template_id, result.llm_used, result.match_score,
@@ -210,7 +282,7 @@ def main():
                 st.success(
                     f"{badge} | template=`{result.template_id}` | "
                     f"score={result.match_score:.2f} | "
-                    f"valid={'\u2713' if result.validation_passed else '\u2717'}"
+                    f"valid={'✓' if result.validation_passed else '✗'}"
                 )
 
         if st.session_state.extraction_result:
@@ -232,7 +304,7 @@ def main():
                 })
 
             st.divider()
-            st.subheader("\U0001f4ac Chat with this document")
+            st.subheader("💬 Chat with this document")
             for msg in st.session_state.messages:
                 with st.chat_message(msg["role"]):
                     st.markdown(msg["content"])
@@ -247,11 +319,15 @@ def main():
                     st.markdown(answer)
                 st.session_state.messages.append({"role": "assistant", "content": answer})
 
-    # \u2500\u2500 Score history tab \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
     with tab_scores:
-        if st.button("\U0001f504 Refresh"):
+        if st.button("🔄 Refresh"):
             st.rerun()
         _render_score_dashboard()
+
+    with tab_templates:
+        if st.button("🔄 Refresh", key="tmpl_refresh"):
+            st.rerun()
+        _render_template_editor()
 
 
 if __name__ == "__main__":
