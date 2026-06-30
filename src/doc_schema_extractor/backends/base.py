@@ -68,7 +68,7 @@ CRITICAL RULES FOR REGEXES:
   WRONG: "(Bestellnummer\\s*[:\\-]?\\s*)([A-Z0-9]+)"  <- two groups
   WRONG: "Bestellnummer\\s*(.*)"  <- .* is too greedy, captures the whole rest of line
   CORRECT: "Bestellnummer\\s*[:\\-]?\\s*([A-Za-z0-9\\-\\/]+)"
-- For decimal amounts: capture the raw German number including dots and comma: e.g. (1\.234,56)
+- For decimal amounts: capture the raw German number including dots and comma: e.g. (1\\.234,56)
   Pattern example: "(?:Netto|Gesamt)\\s*[:\\-]?\\s*([\\d\\.]+,[\\d]{2})"
 - For dates: capture ONLY the date digits DD.MM.YYYY, not the label word.
   Pattern example: "Datum\\s*[:\\-]?\\s*(\\d{1,2}\\.\\d{1,2}\\.\\d{2,4})"
@@ -76,6 +76,16 @@ CRITICAL RULES FOR REGEXES:
 - anchor_regex and stop_regex are also valid Python re patterns but do NOT need a capture group.
 - Do NOT include trailing \\s or open-ended quantifiers that span multiple lines.
 - All backslashes in JSON strings must be double-escaped: \\d not \d.
+
+DATE REGEX ANTI-PATTERNS — never produce any of these:
+  WRONG: "([A-Za-z\u2013]{4}-\u2013\u2013\u2013 \u2013\u2013:\u2013\u2013\u2013)"   <- hallucinated placeholder with dashes
+  WRONG: "(0q.0v.2&4)"                    <- garbage characters
+  WRONG: "YYYY-MM-DD"                     <- not a regex, it is a format string
+  WRONG: "([A-Za-z\u2013]+)"              <- en-dashes and letters are not date digits
+  CORRECT for ISO dates:    "(\\d{4}-\\d{2}-\\d{2})"           date_format: "%Y-%m-%d"
+  CORRECT for German dates: "(\\d{1,2}\\.\\d{1,2}\\.\\d{4})"  date_format: "%d.%m.%Y"
+  date_format MUST use Python strptime codes only: %d %m %Y %y %H %M %S — nothing else.
+  If the document has no recognisable date, set regex to null and extracted_data value to null.
 
 FINGERPRINT RULES:
 - required_keywords must be 4-6 words that appear VERBATIM in this doc type and NOT in others.
@@ -86,6 +96,25 @@ EXTRACTED_DATA RULES:
 - extracted_data must have a key for every field in extraction_rules.
 - Use null (JSON null) if the value is not found, do NOT use empty string or "N/A".
 - For table fields, extracted_data value must be a JSON array of objects (one per row).
+
+SELF-CHECK — complete these steps mentally before producing output:
+For every extraction_rule where regex is not null:
+  1. Find the exact value string in the document text above (e.g. "7076182617" or "18.06.2026").
+  2. Write your regex so that applying it to the document text returns that exact string as group(1).
+  3. Set extracted_data for that field to the SAME value your regex would capture.
+  4. If you cannot construct a regex that matches the actual value in the text,
+     set regex to null and still populate extracted_data with the literal value.
+
+Example grounding check:
+  Document contains: "Bestelldatum  18.06.2026"
+  extracted_data["order_date"] = "18.06.2026"
+  regex = "Bestelldatum\\s*(\\d{1,2}\\.\\d{1,2}\\.\\d{4})"
+  Verify: does (\\d{1,2}\\.\\d{1,2}\\.\\d{4}) match "18.06.2026"? YES -> ship it.
+
+  Document contains: "Auftrags Nummer  7076182617"
+  extracted_data["order_number"] = "7076182617"
+  regex = "Auftrags Nummer\\s*([0-9]+)"
+  Verify: does ([0-9]+) match "7076182617"? YES -> ship it.
 """
 
 
