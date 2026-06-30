@@ -24,10 +24,12 @@ from .validator import Validator
 
 logger = get_logger("extractor")
 
-# How many critical (not_null) fields must fail before we fall back to LLM.
-# 1 means any single missing required field triggers LLM (old behaviour - too strict).
-# 2+ means we tolerate minor rule failures.
 _VALIDATION_FALLBACK_THRESHOLD = int(os.getenv("VALIDATION_FALLBACK_THRESHOLD", "2"))
+
+# Minimum keyword hit-rate on a MISS to attempt family-based near-miss reuse.
+# If the best candidate scores above this but below threshold, we treat it as
+# a near-miss and pass the existing template to the LLM for updating.
+_NEAR_MISS_MIN_SCORE = float(os.getenv("NEAR_MISS_MIN_SCORE", "0.3"))
 
 
 def _build_default_backend() -> LLMBackend:
@@ -42,10 +44,8 @@ def _build_default_backend() -> LLMBackend:
 
 
 def _resolve_store_path(raw: str | Path) -> Path:
-    """Always resolve the store path to an absolute path so it is stable regardless of cwd."""
     p = Path(raw)
     if not p.is_absolute():
-        # Anchor relative paths to the project root (two levels above this file)
         project_root = Path(__file__).resolve().parent.parent.parent
         p = project_root / p
     p.parent.mkdir(parents=True, exist_ok=True)
@@ -92,8 +92,6 @@ class Extractor:
 
         result = ExtractionResult(document_path=str(path), raw_text=doc.full_text)
 
-        # Use normalised_text for fingerprint matching so concatenated PDF tokens
-        # are split before comparison (e.g. "API-EditorDennis" -> "API-Editor Dennis").
         template, score, candidate_scores = self._store.match_with_scores(
             doc.normalised_text, self._threshold
         )
@@ -111,7 +109,6 @@ class Extractor:
             logger.info("Template HIT template_id=%s score=%.3f", template.template_id, score)
             result.template_id = template.template_id
 
-            # Run rule engine FIRST, then trace with extracted fields.
             data = self._rule_engine.apply(template, doc)
             trace_rule_engine(
                 template_id=template.template_id,
@@ -119,7 +116,6 @@ class Extractor:
                 extracted_fields=data,
             )
 
-            # Run validator FIRST, then trace with pass/fail outcome.
             passed, errors = self._validator.validate(data, template)
             trace_validator(
                 template_id=template.template_id,
@@ -138,7 +134,6 @@ class Extractor:
                 logger.info("Extraction complete via template template_id=%s", template.template_id)
                 return result
 
-            # Count only critical (not_null) failures
             critical_errors = [e for e in errors if "null or empty" in e]
             logger.warning(
                 "Validation failed template_id=%s critical=%s/%s errors=%s",
@@ -146,7 +141,6 @@ class Extractor:
             )
 
             if len(critical_errors) < _VALIDATION_FALLBACK_THRESHOLD:
-                # Tolerate minor failures - return what we have
                 logger.info(
                     "Tolerating %s critical error(s) below threshold=%s, returning template result",
                     len(critical_errors), _VALIDATION_FALLBACK_THRESHOLD,
@@ -170,8 +164,32 @@ class Extractor:
             self._write_audit(result, candidate_scores, t_start)
             return result
 
-        logger.info("Template MISS score=%.3f; falling back to LLM", score)
-        result = self._llm_extract(result, doc.full_text, source_text=doc.full_text)
+        # --- MISS path ---
+        # Before calling the LLM cold, check for a near-miss: a template that
+        # scored above _NEAR_MISS_MIN_SCORE but below threshold.  If found,
+        # also check family similarity (doc_type + supplier) from the raw LLM
+        # response is unavailable yet, so we use the best scoring candidate
+        # directly.  The LLM will be instructed to reuse its template_id.
+        near_miss_template: Template | None = None
+        if score >= _NEAR_MISS_MIN_SCORE and candidate_scores:
+            best_id = max(candidate_scores, key=lambda k: candidate_scores[k])
+            best_candidate = self._store.get(best_id)
+            if best_candidate:
+                logger.info(
+                    "Near-miss candidate id=%s score=%.3f; will pass to LLM for update",
+                    best_id, score,
+                )
+                near_miss_template = best_candidate
+
+        logger.info(
+            "Template MISS score=%.3f near_miss=%s; falling back to LLM",
+            score, near_miss_template.template_id if near_miss_template else None,
+        )
+        result = self._llm_extract(
+            result, doc.full_text,
+            existing_template=near_miss_template,
+            source_text=doc.full_text,
+        )
         self._write_audit(result, candidate_scores, t_start)
         return result
 
@@ -192,8 +210,21 @@ class Extractor:
                 raw_text, existing_template=existing_template
             )
             template = _build_template_from_llm_response(llm_response)
-            # Sanitise: validate regexes AND filter keywords for discriminativeness
             template = sanitise_template(template, source_text or raw_text, store=self._store)
+
+            # If the LLM ignored the existing_template_id instruction and created a new
+            # template_id, but we know the near-miss family — merge into existing.
+            if (
+                existing_template is not None
+                and template.template_id != existing_template.template_id
+                and self._store.get(existing_template.template_id) is not None
+            ):
+                logger.warning(
+                    "LLM created new id=%s despite existing_template=%s; merging into existing",
+                    template.template_id, existing_template.template_id,
+                )
+                template = _merge_into_existing(template, existing_template)
+
             self._store.add(template)
             result.template_id = template.template_id
             result.llm_used = True
@@ -201,7 +232,6 @@ class Extractor:
             result.llm_model = self._backend.model
             result.data = llm_response.get("extracted_data", {})
             result.validation_passed = True
-            # Trace AFTER LLM call completes so outputs carry real results.
             trace_llm_call(
                 backend=self._backend.name,
                 model=self._backend.model,
@@ -244,6 +274,38 @@ class Extractor:
         return text[: self._raw_preview_chars] + ("..." if len(text) > self._raw_preview_chars else "")
 
 
+def _merge_into_existing(new: Template, existing: Template) -> Template:
+    """Merge a newly LLM-generated template into an existing one.
+
+    - Reuses existing template_id, created_at, hit_count
+    - Takes new extraction_rules (fresher regexes from LLM)
+    - Unions keywords, deduplicates case-insensitively
+    - Keeps the lower keyword_quorum of the two (more permissive)
+    """
+    existing_kws_lower = {kw.lower() for kw in existing.fingerprint.required_keywords}
+    merged_kws = list(existing.fingerprint.required_keywords)
+    for kw in new.fingerprint.required_keywords:
+        if kw.lower() not in existing_kws_lower:
+            merged_kws.append(kw)
+
+    new.template_id = existing.template_id
+    new.created_at = existing.created_at
+    new.hit_count = existing.hit_count
+    new.fingerprint.required_keywords = merged_kws
+    new.fingerprint.keyword_quorum = min(
+        new.fingerprint.keyword_quorum,
+        existing.fingerprint.keyword_quorum,
+    )
+    logger.info(
+        "Merged template id=%s keywords=%s->%s quorum=%.2f",
+        new.template_id,
+        len(existing.fingerprint.required_keywords),
+        len(merged_kws),
+        new.fingerprint.keyword_quorum,
+    )
+    return new
+
+
 def _build_template_from_llm_response(resp: dict[str, Any]) -> Template:
     rules = [
         ExtractionRule(
@@ -272,6 +334,7 @@ def _build_template_from_llm_response(resp: dict[str, Any]) -> Template:
         required_keywords=fp_raw.get("required_keywords", []),
         supplier_hint=fp_raw.get("supplier_hint", ""),
         doc_type=fp_raw.get("doc_type", "unknown"),
+        keyword_quorum=fp_raw.get("keyword_quorum", 0.6),
     )
     return Template(
         template_id=resp.get("template_id", "unknown_v1"),

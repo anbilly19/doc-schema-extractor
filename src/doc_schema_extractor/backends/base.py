@@ -22,7 +22,8 @@ JSON schema:
   "fingerprint": {
     "required_keywords": ["word1", "word2", "word3", "word4"],
     "supplier_hint": "<exact supplier company name from document>",
-    "doc_type": "<order_confirmation|delivery_note|invoice|purchase_order|other>"
+    "doc_type": "<order_confirmation|delivery_note|invoice|purchase_order|other>",
+    "keyword_quorum": 0.6
   },
   "extraction_rules": [
     {
@@ -80,7 +81,7 @@ CRITICAL RULES FOR REGEXES:
 DATE REGEX ANTI-PATTERNS — never produce any of these:
   WRONG: hallucinated placeholder with dashes like "([A-Za-z]{4}-... ...)"  <- never
   WRONG: garbage like "(0q.0v.2&4)"                <- not a regex
-  WRONG: "YYYY-MM-DD"                              <- not a regex, it is a format string
+  WRONG: "YYYY-MM-DD"                              <- not a format string
   CORRECT for ISO dates:    "(\\d{4}-\\d{2}-\\d{2})"           date_format: "%Y-%m-%d"
   CORRECT for German dates: "(\\d{1,2}\\.\\d{1,2}\\.\\d{4})"  date_format: "%d.%m.%Y"
   date_format MUST use Python strptime codes only: %d %m %Y %y %H %M %S — nothing else.
@@ -90,6 +91,12 @@ FINGERPRINT RULES:
 - required_keywords must be 4-6 words that appear VERBATIM in this doc type and NOT in others.
 - Do not use generic words like "GmbH", "EUR", "Datum" as keywords.
 - supplier_hint must be the exact company name string as it appears in the document.
+- keyword_quorum: float between 0.0 and 1.0 — what fraction of required_keywords must match
+  for this template to be selected. Use 0.6 as default (3 of 5 keywords suffice).
+  Use 0.8+ only if ALL your keywords are truly invariant across every instance of this doc type.
+  IMPORTANT: keywords that appear only on SOME instances (recipient names, addresses,
+  greetings, product names) LOWER the effective quorum — prefer structural keywords
+  (column headers, form labels, company name, document type headers) that appear on EVERY instance.
 
 EXTRACTED_DATA RULES:
 - extracted_data must have a key for every field in extraction_rules.
@@ -109,11 +116,24 @@ Example grounding check:
   extracted_data["order_date"] = "18.06.2026"
   regex = "Bestelldatum\\s*(\\d{1,2}\\.\\d{1,2}\\.\\d{4})"
   Verify: does (\\d{1,2}\\.\\d{1,2}\\.\\d{4}) match "18.06.2026"? YES -> ship it.
+"""
 
-  Document contains: "Auftrags Nummer  7076182617"
-  extracted_data["order_number"] = "7076182617"
-  regex = "Auftrags Nummer\\s*([0-9]+)"
-  Verify: does ([0-9]+) match "7076182617"? YES -> ship it.
+EXISTING_TEMPLATE_PREFIX = """IMPORTANT: A similar template already exists in the store for this document family.
+Existing template_id: {template_id}
+Existing keywords:    {keywords}
+Existing doc_type:    {doc_type}
+Existing supplier:    {supplier_hint}
+
+You MUST:
+1. Reuse the SAME template_id: "{template_id}" — do NOT invent a new one.
+2. In required_keywords, produce the UNION of the existing keywords and any new structural
+   keywords you find in this document. Remove keywords that are document-instance specific
+   (recipient names, addresses, product names, greetings). Keep only structural keywords
+   that appear on EVERY document of this type (form labels, column headers, company name,
+   document type headers).
+3. Set keyword_quorum to 0.6 unless you are certain all keywords are invariant.
+4. Keep extraction_rules compatible with both documents — use alternation (A|B) in regexes
+   where the label text differs slightly between instances.
 """
 
 
