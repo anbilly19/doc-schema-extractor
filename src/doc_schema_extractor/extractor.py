@@ -92,10 +92,10 @@ class Extractor:
 
         result = ExtractionResult(document_path=str(path), raw_text=doc.full_text)
 
-        # Run match FIRST, then trace with the actual results so LangSmith
-        # outputs contain matched_template_id / score, not just inputs.
+        # Use normalised_text for fingerprint matching so concatenated PDF tokens
+        # are split before comparison (e.g. "API-EditorDennis" -> "API-Editor Dennis").
         template, score, candidate_scores = self._store.match_with_scores(
-            doc.full_text, self._threshold
+            doc.normalised_text, self._threshold
         )
         result.match_score = score
         trace_template_match(
@@ -164,7 +164,9 @@ class Extractor:
                 len(critical_errors), _VALIDATION_FALLBACK_THRESHOLD,
             )
             result.validation_errors = errors
-            result = self._llm_extract(result, doc.full_text, existing_template=template, source_text=doc.full_text)
+            result = self._llm_extract(
+                result, doc.full_text, existing_template=template, source_text=doc.full_text
+            )
             self._write_audit(result, candidate_scores, t_start)
             return result
 
@@ -190,8 +192,8 @@ class Extractor:
                 raw_text, existing_template=existing_template
             )
             template = _build_template_from_llm_response(llm_response)
-            # Sanitise and validate all LLM-generated regexes before saving
-            template = sanitise_template(template, source_text or raw_text)
+            # Sanitise: validate regexes AND filter keywords for discriminativeness
+            template = sanitise_template(template, source_text or raw_text, store=self._store)
             self._store.add(template)
             result.template_id = template.template_id
             result.llm_used = True
