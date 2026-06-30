@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from dataclasses import dataclass, field
 
@@ -11,6 +12,31 @@ import pdfplumber
 from .logging_utils import get_logger
 
 logger = get_logger("text_extractor")
+
+# ---------------------------------------------------------------------------
+# Text normalisation
+# ---------------------------------------------------------------------------
+# Some PDFs produce concatenated runs like "2013271004026048719.06.2026API-EditorDennis".
+# Splitting on camelCase and digit/letter boundaries makes keyword matching robust
+# to PDF rendering quality without altering the semantic content.
+
+_RE_LOWER_UPPER = re.compile(r'([a-z])([A-Z])')
+_RE_DIGIT_ALPHA = re.compile(r'(\d)([A-Za-z])')
+_RE_ALPHA_DIGIT = re.compile(r'([A-Za-z])(\d)')
+_RE_MULTI_SPACE = re.compile(r'  +')
+
+
+def normalise_text(text: str) -> str:
+    """Insert spaces at camelCase and digit/letter boundaries.
+
+    Preserves all original tokens; only adds spaces so keyword matching
+    works regardless of PDF renderer concatenation artefacts.
+    """
+    text = _RE_LOWER_UPPER.sub(r'\1 \2', text)
+    text = _RE_DIGIT_ALPHA.sub(r'\1 \2', text)
+    text = _RE_ALPHA_DIGIT.sub(r'\1 \2', text)
+    text = _RE_MULTI_SPACE.sub(' ', text)
+    return text
 
 
 @dataclass
@@ -24,7 +50,8 @@ class PageContent:
 class DocumentContent:
     path: str
     file_type: str
-    full_text: str
+    full_text: str         # raw text as extracted (used for regex rules)
+    normalised_text: str   # space-normalised version (used for fingerprint matching)
     pages: list[PageContent] = field(default_factory=list)
 
 
@@ -60,15 +87,20 @@ class TextExtractor:
                 ]
                 logger.debug(
                     "PDF page=%s chars=%s tables=%s",
-                    i + 1,
-                    len(text),
-                    len(normalized_tables),
+                    i + 1, len(text), len(normalized_tables),
                 )
                 pages.append(PageContent(page_num=i + 1, text=text, tables=normalized_tables))
                 all_text_parts.append(text)
 
+        full_text = "\n".join(all_text_parts)
         logger.info("Finished PDF extraction path=%s pages=%s", path, len(pages))
-        return DocumentContent(path=str(path), file_type="pdf", full_text="\n".join(all_text_parts), pages=pages)
+        return DocumentContent(
+            path=str(path),
+            file_type="pdf",
+            full_text=full_text,
+            normalised_text=normalise_text(full_text),
+            pages=pages,
+        )
 
     def _extract_xlsx(self, path: Path) -> DocumentContent:
         logger.debug("Extracting XLSX path=%s", path)
@@ -92,5 +124,12 @@ class TextExtractor:
             pages.append(PageContent(page_num=len(pages) + 1, text=text, tables=[rows]))
             all_text_parts.append(f"[Sheet: {sheet_name}]\n{text}")
 
+        full_text = "\n".join(all_text_parts)
         logger.info("Finished XLSX extraction path=%s sheets=%s", path, len(pages))
-        return DocumentContent(path=str(path), file_type="xlsx", full_text="\n".join(all_text_parts), pages=pages)
+        return DocumentContent(
+            path=str(path),
+            file_type="xlsx",
+            full_text=full_text,
+            normalised_text=normalise_text(full_text),
+            pages=pages,
+        )

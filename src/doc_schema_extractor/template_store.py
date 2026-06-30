@@ -60,13 +60,18 @@ class TemplateStore:
         return False
 
     def match_with_scores(
-        self, raw_text: str, threshold: float = 0.75
+        self, normalised_text: str, threshold: float = 0.75
     ) -> tuple[Template | None, float, dict[str, float]]:
-        """Match template and return (best_template, best_score, all_candidate_scores)."""
+        """Match template against normalised document text.
+
+        Scoring: keyword hit-rate (0-1) + small supplier fuzzy-match boost (0-0.1).
+        Both the document text and stored keywords are lowercased for comparison.
+        """
         if not self._templates:
             logger.info("Template match skipped: no templates loaded")
             return None, 0.0, {}
 
+        text_lower = normalised_text.lower()
         best_template: Template | None = None
         best_score = 0.0
         candidate_scores: dict[str, float] = {}
@@ -74,11 +79,11 @@ class TemplateStore:
         for template in self._templates.values():
             fp = template.fingerprint
             keywords = fp.required_keywords
-            hits = sum(1 for kw in keywords if kw.lower() in raw_text.lower())
+            hits = sum(1 for kw in keywords if kw.lower() in text_lower)
             keyword_score = hits / len(keywords) if keywords else 0.0
             supplier_boost = 0.0
             if fp.supplier_hint:
-                ratio = fuzz.partial_ratio(fp.supplier_hint.lower(), raw_text.lower()) / 100
+                ratio = fuzz.partial_ratio(fp.supplier_hint.lower(), text_lower) / 100
                 supplier_boost = 0.1 * ratio
             score = min(1.0, keyword_score + supplier_boost)
             candidate_scores[template.template_id] = round(score, 4)
@@ -91,13 +96,18 @@ class TemplateStore:
                 best_template = template
 
         if best_score >= threshold:
-            logger.info("Template match HIT id=%s score=%.3f threshold=%.3f", best_template.template_id if best_template else None, best_score, threshold)
+            logger.info(
+                "Template match HIT id=%s score=%.3f threshold=%.3f",
+                best_template.template_id if best_template else None, best_score, threshold,
+            )
             return best_template, best_score, candidate_scores
 
-        logger.info("Template match MISS best_id=%s score=%.3f threshold=%.3f", best_template.template_id if best_template else None, best_score, threshold)
+        logger.info(
+            "Template match MISS best_id=%s score=%.3f threshold=%.3f",
+            best_template.template_id if best_template else None, best_score, threshold,
+        )
         return None, best_score, candidate_scores
 
-    # Keep old signature for backward compat
-    def match(self, raw_text: str, threshold: float = 0.75) -> tuple[Template | None, float]:
-        t, s, _ = self.match_with_scores(raw_text, threshold)
+    def match(self, normalised_text: str, threshold: float = 0.75) -> tuple[Template | None, float]:
+        t, s, _ = self.match_with_scores(normalised_text, threshold)
         return t, s
