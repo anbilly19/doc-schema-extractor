@@ -64,8 +64,16 @@ class TemplateStore:
     ) -> tuple[Template | None, float, dict[str, float]]:
         """Match template against normalised document text.
 
-        Scoring: keyword hit-rate (0-1) + small supplier fuzzy-match boost (0-0.1).
-        Both the document text and stored keywords are lowercased for comparison.
+        Scoring:
+          keyword_score = hits / total_keywords   (raw hit rate)
+          quorum_met    = keyword_score >= fingerprint.keyword_quorum
+          score         = keyword_score + supplier_boost (capped at 1.0)
+
+        A template only enters HIT consideration if its quorum is met AND
+        its final score >= threshold.  This means a template with quorum=0.6
+        and 3/5 keywords hit scores 0.6 (+ up to 0.1 supplier boost) and can
+        reach threshold=0.75 via the supplier match — giving robust two-way
+        matching for document families with variable recipient/address fields.
         """
         if not self._templates:
             logger.info("Template match skipped: no templates loaded")
@@ -79,26 +87,47 @@ class TemplateStore:
         for template in self._templates.values():
             fp = template.fingerprint
             keywords = fp.required_keywords
-            hits = sum(1 for kw in keywords if kw.lower() in text_lower)
-            keyword_score = hits / len(keywords) if keywords else 0.0
-            supplier_boost = 0.0
-            if fp.supplier_hint:
-                ratio = fuzz.partial_ratio(fp.supplier_hint.lower(), text_lower) / 100
-                supplier_boost = 0.1 * ratio
-            score = min(1.0, keyword_score + supplier_boost)
+            if not keywords:
+                score = 0.0
+            else:
+                hits = sum(1 for kw in keywords if kw.lower() in text_lower)
+                keyword_score = hits / len(keywords)
+                supplier_boost = 0.0
+                if fp.supplier_hint:
+                    ratio = fuzz.partial_ratio(fp.supplier_hint.lower(), text_lower) / 100
+                    supplier_boost = 0.1 * ratio
+                score = min(1.0, keyword_score + supplier_boost)
+
             candidate_scores[template.template_id] = round(score, 4)
             logger.debug(
-                "Template candidate id=%s keyword_score=%.3f supplier_boost=%.3f total=%.3f",
-                template.template_id, keyword_score, supplier_boost, score,
+                "Template candidate id=%s keyword_score=%.3f supplier_boost=%.3f total=%.3f quorum=%.2f",
+                template.template_id,
+                (hits / len(keywords)) if keywords else 0.0,
+                supplier_boost if keywords else 0.0,
+                score,
+                fp.keyword_quorum,
             )
             if score > best_score:
                 best_score = score
                 best_template = template
 
-        if best_score >= threshold:
+        # Check quorum on best candidate
+        if best_template is not None and best_score >= threshold:
+            fp = best_template.fingerprint
+            kws = fp.required_keywords
+            if kws:
+                hit_rate = sum(1 for kw in kws if kw.lower() in text_lower) / len(kws)
+                if hit_rate < fp.keyword_quorum:
+                    logger.info(
+                        "Template MISS: best candidate id=%s score=%.3f but quorum not met "
+                        "hit_rate=%.2f quorum=%.2f",
+                        best_template.template_id, best_score, hit_rate, fp.keyword_quorum,
+                    )
+                    return None, best_score, candidate_scores
+
             logger.info(
                 "Template match HIT id=%s score=%.3f threshold=%.3f",
-                best_template.template_id if best_template else None, best_score, threshold,
+                best_template.template_id, best_score, threshold,
             )
             return best_template, best_score, candidate_scores
 
