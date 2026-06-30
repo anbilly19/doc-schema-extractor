@@ -14,25 +14,22 @@ from .logging_utils import get_logger
 
 logger = get_logger("text_extractor")
 
-# ---------------------------------------------------------------------------
-# Text normalisation
-# ---------------------------------------------------------------------------
-# Some PDFs produce concatenated runs like "2013271004026048719.06.2026API-EditorDennis".
-# Splitting on camelCase and digit/letter boundaries makes keyword matching robust
-# to PDF rendering quality without altering the semantic content.
-
 _RE_LOWER_UPPER = re.compile(r'([a-z])([A-Z])')
 _RE_DIGIT_ALPHA = re.compile(r'(\d)([A-Za-z])')
 _RE_ALPHA_DIGIT = re.compile(r'([A-Za-z])(\d)')
 _RE_MULTI_SPACE = re.compile(r'  +')
+# Strip [Sheet: ...] markers before fingerprint normalisation so sheet names
+# never become discriminating keywords.
+_RE_SHEET_MARKER = re.compile(r'\[Sheet:[^\]]*\]\s*')
 
 
 def normalise_text(text: str) -> str:
     """Insert spaces at camelCase and digit/letter boundaries.
 
-    Preserves all original tokens; only adds spaces so keyword matching
-    works regardless of PDF renderer concatenation artefacts.
+    Also strips [Sheet: ...] markers so XLSX sheet names do not pollute
+    fingerprint keyword matching.
     """
+    text = _RE_SHEET_MARKER.sub(' ', text)
     text = _RE_LOWER_UPPER.sub(r'\1 \2', text)
     text = _RE_DIGIT_ALPHA.sub(r'\1 \2', text)
     text = _RE_ALPHA_DIGIT.sub(r'\1 \2', text)
@@ -45,15 +42,17 @@ class PageContent:
     page_num: int
     text: str
     tables: list[list[list[str | None]]] = field(default_factory=list)
+    sheet_name: str = ""
 
 
 @dataclass
 class DocumentContent:
     path: str
     file_type: str
-    full_text: str         # raw text as extracted (used for regex rules)
-    normalised_text: str   # space-normalised version (used for fingerprint matching)
+    full_text: str
+    normalised_text: str
     pages: list[PageContent] = field(default_factory=list)
+    sheet_names: list[str] = field(default_factory=list)
 
 
 class TextExtractor:
@@ -106,9 +105,6 @@ class TextExtractor:
     def _extract_xlsx(self, path: Path) -> DocumentContent:
         logger.debug("Extracting XLSX path=%s", path)
 
-        # openpyxl emits UserWarnings for unsupported-but-harmless XLSX features
-        # (header/footer XML and Data Validation extensions). Suppress them so
-        # they don't pollute the CLI/Streamlit output.
         with warnings.catch_warnings():
             warnings.filterwarnings(
                 "ignore",
@@ -126,6 +122,7 @@ class TextExtractor:
 
         pages: list[PageContent] = []
         all_text_parts: list[str] = []
+        sheet_names: list[str] = []
 
         for sheet_name in wb.sheetnames:
             ws = wb[sheet_name]
@@ -140,15 +137,24 @@ class TextExtractor:
 
             text = "\n".join(text_lines)
             logger.debug("XLSX sheet=%s rows=%s chars=%s", sheet_name, len(rows), len(text))
-            pages.append(PageContent(page_num=len(pages) + 1, text=text, tables=[rows]))
+            pages.append(PageContent(
+                page_num=len(pages) + 1, text=text, tables=[rows], sheet_name=sheet_name
+            ))
+            sheet_names.append(sheet_name)
+            # [Sheet: ...] markers kept in full_text for rule-engine anchoring,
+            # but stripped from normalised_text by normalise_text() above.
             all_text_parts.append(f"[Sheet: {sheet_name}]\n{text}")
 
         full_text = "\n".join(all_text_parts)
-        logger.info("Finished XLSX extraction path=%s sheets=%s", path, len(pages))
+        logger.info(
+            "Finished XLSX extraction path=%s sheets=%s names=%s",
+            path, len(pages), sheet_names,
+        )
         return DocumentContent(
             path=str(path),
             file_type="xlsx",
             full_text=full_text,
             normalised_text=normalise_text(full_text),
             pages=pages,
+            sheet_names=sheet_names,
         )
