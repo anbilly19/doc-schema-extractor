@@ -111,17 +111,17 @@ def _render_score_dashboard() -> None:
     for r in records:
         rows.append({
             "File": r.get("file", ""),
-            "Template": r.get("template_id") or "—",
+            "Template": r.get("template_id") or "\u2014",
             "Score": f"{r.get('match_score', 0):.3f}",
             "Result": r.get("result", ""),
-            "LLM": "✓" if r.get("llm_used") else "",
-            "Valid": "✓" if r.get("validation_passed") else "✗",
+            "LLM": "\u2713" if r.get("llm_used") else "",
+            "Valid": "\u2713" if r.get("validation_passed") else "\u2717",
             "Fields": r.get("field_count", 0),
             "ms": int(r.get("duration_ms", 0)),
             "Time": r.get("ts", "")[:19].replace("T", " "),
         })
 
-    st.dataframe(rows, use_container_width=True)
+    st.dataframe(rows, width="stretch")
 
     # Per-document candidate score breakdown
     with st.expander("Candidate scores per document (all templates vs each file)"):
@@ -129,9 +129,9 @@ def _render_score_dashboard() -> None:
             cands = r.get("candidate_scores", {})
             if not cands:
                 continue
-            st.markdown(f"**{r.get('file')}** — best: `{r.get('template_id') or 'MISS'}` ({r.get('match_score', 0):.3f})")
+            st.markdown(f"**{r.get('file')}** \u2014 best: `{r.get('template_id') or 'MISS'}` ({r.get('match_score', 0):.3f})")
             score_rows = [{"Template": tid, "Score": f"{s:.4f}"} for tid, s in sorted(cands.items(), key=lambda x: -x[1])]
-            st.dataframe(score_rows, use_container_width=True, hide_index=True)
+            st.dataframe(score_rows, width="stretch", hide_index=True)
 
     # Raw JSONL download
     raw_lines = "\n".join(json.dumps(r, ensure_ascii=False) for r in records)
@@ -144,12 +144,12 @@ def _render_score_dashboard() -> None:
 
 
 def main():
-    st.set_page_config(page_title="Doc Schema Extractor", page_icon="📄", layout="wide")
-    st.title("📄 Doc Schema Extractor")
+    st.set_page_config(page_title="Doc Schema Extractor", page_icon="\U0001f4c4", layout="wide")
+    st.title("\U0001f4c4 Doc Schema Extractor")
     logger.info("Streamlit UI started")
 
     with st.sidebar:
-        st.header("⚙️ Config")
+        st.header("\u2699\ufe0f Config")
         default_backend = _default_backend()
         backend_index = 0 if default_backend == "ollama" else 1
         backend_name = st.selectbox("LLM Backend", ["ollama", "openai"], index=backend_index)
@@ -166,7 +166,7 @@ def main():
         st.divider()
         langsmith_on = os.getenv("LANGSMITH_TRACING", "false").lower() == "true"
         if langsmith_on:
-            st.success(f"LangSmith ON\n`{os.getenv('LANGSMITH_PROJECT', '—')}`")
+            st.success(f"LangSmith ON\n`{os.getenv('LANGSMITH_PROJECT', '\u2014')}`")
         else:
             st.warning("LangSmith OFF")
 
@@ -177,7 +177,7 @@ def main():
 
     tab_extract, tab_scores = st.tabs(["Extract", "Score History"])
 
-    # ── Extract tab ───────────────────────────────────────────────────────
+    # \u2500\u2500 Extract tab \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
     with tab_extract:
         uploaded = st.file_uploader("Upload PDF or XLSX", type=["pdf", "xlsx"])
         if uploaded:
@@ -187,7 +187,7 @@ def main():
                 tmp_path = tmp.name
             logger.info("Uploaded file name=%s temp_path=%s", uploaded.name, tmp_path)
 
-            if st.button("▶ Run Extraction", type="primary"):
+            if st.button("\u25b6 Run Extraction", type="primary"):
                 from doc_schema_extractor import Extractor
                 from doc_schema_extractor.backends import OllamaBackend, OpenAIBackend
 
@@ -202,7 +202,7 @@ def main():
 
                 st.session_state.extraction_result = json.loads(result.model_dump_json())
                 st.session_state.messages = []
-                badge = "🟡 LLM" if result.llm_used else "🟢 Template HIT"
+                badge = "\U0001f7e1 LLM" if result.llm_used else "\U0001f7e2 Template HIT"
                 logger.info(
                     "UI extraction complete template_id=%s llm_used=%s score=%.3f",
                     result.template_id, result.llm_used, result.match_score,
@@ -210,7 +210,7 @@ def main():
                 st.success(
                     f"{badge} | template=`{result.template_id}` | "
                     f"score={result.match_score:.2f} | "
-                    f"valid={'✓' if result.validation_passed else '✗'}"
+                    f"valid={'\u2713' if result.validation_passed else '\u2717'}"
                 )
 
         if st.session_state.extraction_result:
@@ -232,7 +232,7 @@ def main():
                 })
 
             st.divider()
-            st.subheader("💬 Chat with this document")
+            st.subheader("\U0001f4ac Chat with this document")
             for msg in st.session_state.messages:
                 with st.chat_message(msg["role"]):
                     st.markdown(msg["content"])
@@ -247,9 +247,9 @@ def main():
                     st.markdown(answer)
                 st.session_state.messages.append({"role": "assistant", "content": answer})
 
-    # ── Score history tab ─────────────────────────────────────────────────
+    # \u2500\u2500 Score history tab \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
     with tab_scores:
-        if st.button("🔄 Refresh"):
+        if st.button("\U0001f504 Refresh"):
             st.rerun()
         _render_score_dashboard()
 
